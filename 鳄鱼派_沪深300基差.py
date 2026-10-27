@@ -337,19 +337,25 @@ def set_autostart(on):
             if os.path.exists(lnk):
                 os.remove(lnk)
             return True, "已关闭开机自启"
-        exe = sys.executable or ""
-        if exe.lower().endswith("python.exe"):
-            pyw = exe[:-len("python.exe")] + "pythonw.exe"
-            if os.path.exists(pyw):
-                exe = pyw
-        script = os.path.abspath(__file__)
-        wd = os.path.dirname(script)
+        if getattr(sys, "frozen", False):     # PyInstaller 打包后的 exe
+            exe = sys.executable or ""
+            script = ""
+            wd = os.path.dirname(exe)
+        else:
+            exe = sys.executable or ""
+            if exe.lower().endswith("python.exe"):
+                pyw = exe[:-len("python.exe")] + "pythonw.exe"
+                if os.path.exists(pyw):
+                    exe = pyw
+            script = os.path.abspath(__file__)
+            wd = os.path.dirname(script)
         q = lambda s: s.replace("'", "''")
+        args = ('"%s"' % q(script)) if script else ""
         ps = (
             "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');"
-            "$s.TargetPath='%s';$s.Arguments='\"%s\"';"
+            "$s.TargetPath='%s';$s.Arguments='%s';"
             "$s.WorkingDirectory='%s';$s.IconLocation='%s,0';$s.Save()"
-        ) % (q(lnk), q(exe), q(script), q(wd), q(exe))
+        ) % (q(lnk), q(exe), args, q(wd), q(exe))
         os.makedirs(os.path.dirname(lnk), exist_ok=True)
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                            capture_output=True, timeout=40, creationflags=0x08000000)
@@ -841,6 +847,23 @@ def _single_instance():
         return True
 
 
+def _res_path(name):
+    """兼容 PyInstaller：打包后资源在 sys._MEIPASS 里。"""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, name)
+
+
+def _apply_icon(root):
+    for name in ("鳄鱼派.ico", "icon.ico"):
+        p = _res_path(name)
+        if os.path.exists(p):
+            try:
+                root.iconbitmap(default=p)
+                return
+            except Exception:
+                pass
+
+
 def main():
     _relaunch_hidden()
     try:
@@ -854,7 +877,8 @@ def main():
         return
 
     root = tk.Tk()
-    root.title(APP_NAME)
+    root.title(APP_TITLE)
+    _apply_icon(root)
     BasisWidget(root)
     root.mainloop()
 

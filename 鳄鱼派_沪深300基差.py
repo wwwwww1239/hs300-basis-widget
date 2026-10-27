@@ -29,9 +29,11 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import messagebox
 
 import requests
@@ -43,9 +45,12 @@ INTERVAL_CHOICES = (1, 2, 3, 5, 10, 30)
 # =============================================
 
 APP_NAME = "鳄鱼派 沪深300基差"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_TITLE = "%s v%s" % (APP_NAME, APP_VERSION)
 HEAD_TITLE = "鳄鱼派 · 沪深300基差"   # 窗体内左上角标题
+REPO = "wwwwww1239/hs300-basis-widget"
+REPO_URL = "https://github.com/" + REPO
+UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % REPO
 CFG_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "HS300BasisWidget")
 CFG_PATH = os.path.join(CFG_DIR, "settings.json")
 
@@ -449,9 +454,22 @@ class BasisWidget:
         self.err_count = 0
         self.W, self.H = COMPACT_W, COMPACT_H
         self.drag = None
+        self.resize = None
         self.autostart_var = None
+        self.update = None          # 发现的可用新版本
+        self.upd_win = None         # 更新提示小窗
+        self._upd_busy = False
 
-        self.S = 1.0
+        try:
+            self.S = min(2.5, max(0.75, float(self.cfg.get("scale", 1.0) or 1.0)))
+        except (TypeError, ValueError):
+            self.S = 1.0
+        if "scale" not in self.cfg:
+            # 首次运行：按系统 DPI 放大，125% 屏上默认 1.25 倍，避免字太小
+            try:
+                self.S = min(2.0, max(1.0, round(root.winfo_fpixels("1i") / 96.0, 2)))
+            except Exception:
+                self.S = 1.0
         root.overrideredirect(True)
         root.configure(bg=TRANSPARENT_KEY)
         try:
@@ -493,6 +511,7 @@ class BasisWidget:
         self.render()
         self.root.after(120, self._poll)
         self.root.after(1000, self._watchdog)
+        self.root.after(8000, lambda: self.check_update_async(False))
 
     # ---------------- 布局 ----------------
     def _size(self):
@@ -574,11 +593,17 @@ class BasisWidget:
         cv.create_text(14, 110, text=foot, fill=tcol, anchor="w",
                        font=self._font(7.5, family=FNUM))
         if tail:
-            cv.create_text(W - 14, 110, text=tail, fill=tcol, anchor="e",
+            cv.create_text(W - 34, 110, text=tail, fill=tcol, anchor="e",
                            font=self._font(7, family=FNUM))
 
         if self.expanded:
             self._render_detail(W)
+
+        # 右下角缩放抓手（三道斜线，拖它就能整体放大/缩小）
+        for k in range(3):
+            x2, y2 = W - 9 - k * 4, H - 9 - k * 4
+            cv.create_line(x2 - 6, y2, x2, y2 - 6,
+                           fill="#43506b", width=1, capstyle="round")
 
         if self.S != 1.0:
             cv.scale("all", 0, 0, self.S, self.S)
@@ -647,7 +672,7 @@ class BasisWidget:
         cv.create_line(14, dy, W - 14, dy, fill=COL["line"])
         amt = (" · 成交 %.0f亿" % (sp["amount"] / 1e8)) if sp.get("amount") else ""
         cv.create_text(W / 2.0, dy + 16,
-                       text="持仓量加权(文华口径)%s · %ds 刷新" % (amt, self.interval),
+                       text="持仓量加权(文华口径)%s · %ds" % (amt, self.interval),
                        fill=COL["dim"], anchor="center", font=self._font(7))
 
     # ---------------- 状态 / 数据轮询 ----------------
@@ -668,10 +693,18 @@ class BasisWidget:
                 if kind == "data":
                     self.snap = payload
                     self.err, self.err_count = None, 0
+                    dirty = True
+                elif kind == "update":
+                    self._on_update_info(payload[0], payload[1])
+                elif kind == "upderr":
+                    self._on_upd_err(payload)
+                elif kind == "quit":
+                    self.close()
+                    return
                 else:
                     self.err_count += 1
                     self.err = payload
-                dirty = True
+                    dirty = True
         except queue.Empty:
             pass
         if dirty:
@@ -699,9 +732,12 @@ class BasisWidget:
 
     # ---------------- 交互 ----------------
     def _hit(self, x, y):
-        """返回命中的按钮名：'close' / 'toggle' / None"""
+        """返回命中的按钮名：'close' / 'toggle' / 'grip' / None"""
         s = self.S
         W = self.W * s
+        H = self.H * s
+        if x >= W - 22 * s and y >= H - 22 * s:
+            return "grip"
         if abs(x - (W - 22 * s)) <= 12 * s and abs(y - 19 * s) <= 12 * s:
             return "close"
         if abs(x - (W - 50 * s)) <= 12 * s and abs(y - 19 * s) <= 12 * s:
@@ -716,9 +752,26 @@ class BasisWidget:
         if hit == "toggle":
             self.toggle()
             return
+        if hit == "grip":
+            self.resize = (e.x_root, e.y_root, self.S)
+            return
         self.drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
 
     def _on_drag(self, e):
+        if self.resize is not None:
+            x0, y0, s0 = self.resize
+            bw, bh = self._size()
+            dx, dy = e.x_root - x0, e.y_root - y0
+            if abs(dx) >= abs(dy):
+                ns = (bw * s0 + dx) / float(bw)
+            else:
+                ns = (bh * s0 + dy) / float(bh)
+            ns = min(2.5, max(0.75, ns))
+            if abs(ns - self.S) >= 0.005:
+                self.S = round(ns, 3)
+                self._apply_geometry()
+                self.render()
+            return
         if self.drag is None:
             return
         x = e.x_root - self.drag[0]
@@ -727,6 +780,10 @@ class BasisWidget:
         self.root.geometry("+%d+%d" % (x, y))
 
     def _on_release(self, e):
+        if self.resize is not None:
+            self.resize = None
+            self.cfg["scale"] = self.S
+            save_cfg(self.cfg)
         if self.drag is not None:
             self.cfg["x"], self.cfg["y"] = self.pos[0], self.pos[1]
             save_cfg(self.cfg)
@@ -747,6 +804,12 @@ class BasisWidget:
     def _build_menu(self):
         m = tk.Menu(self.root, tearoff=0)
         m.add_command(label=APP_TITLE, state="disabled")
+        if self.update:
+            m.add_command(label="⬆ 新版本 v%s · 点此更新" % self.update["version"],
+                          command=self.do_update)
+        else:
+            m.add_command(label="检查更新（当前 v%s）" % APP_VERSION,
+                          command=lambda: self.check_update_async(True))
         m.add_separator()
         m.add_command(label="收起详情" if self.expanded else "展开详情", command=self.toggle)
         m.add_separator()
@@ -784,6 +847,169 @@ class BasisWidget:
 
     def refresh_now(self):
         self.feed.kick()
+
+    # ---------------- 在线更新 ----------------
+    def check_update_async(self, manual=False):
+        if self._upd_busy:
+            return
+        self._upd_busy = True
+
+        def job():
+            try:
+                info = fetch_latest_release()
+            except Exception as e:
+                info = ("err", str(e))
+            if isinstance(info, tuple):
+                self.q.put(("upderr", info[1]))
+            else:
+                self.q.put(("update", (info, manual)))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def _on_update_info(self, info, manual):
+        self._upd_busy = False
+        if info is None:
+            if manual:
+                messagebox.showinfo(APP_NAME, "还没有发布任何 Release，暂时无法检查更新。")
+            return
+        newer = _ver_tuple(info["version"]) > _ver_tuple(APP_VERSION)
+        if not newer:
+            if manual:
+                messagebox.showinfo(APP_NAME, "当前已是最新版本 v%s。" % APP_VERSION)
+            return
+        if self.cfg.get("skip_version") == info["version"]:
+            return
+        self.update = info
+        self._show_update_popup()
+
+    def _show_update_popup(self):
+        if not self.update:
+            return
+        if self.upd_win is not None:
+            try:
+                self.upd_win.destroy()
+            except Exception:
+                pass
+            self.upd_win = None
+        w, h = 244, 96
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=TRANSPARENT_KEY)
+        try:
+            win.attributes("-transparentcolor", TRANSPARENT_KEY)
+        except Exception:
+            win.configure(bg=COL["bg"])
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        x = max(0, min(self.pos[0], sw - w))
+        y = self.pos[1] + int(self.H * self.S) + 8
+        if y + h > sh - 40:
+            y = max(0, self.pos[1] - h - 8)
+        win.geometry("%dx%d+%d+%d" % (w, h, x, y))
+
+        cv = tk.Canvas(win, bg=TRANSPARENT_KEY, highlightthickness=0, bd=0)
+        cv.pack(fill="both", expand=True)
+        self._round_rect_cv(cv, 0.5, 0.5, w - 0.5, h - 0.5, 10,
+                            fill=COL["bg2"], outline=COL["line"], width=1)
+        cv.create_text(14, 20, text="发现新版本 v%s" % self.update["version"], anchor="w",
+                       fill=COL["fg"], font=(FN, 10, "bold"))
+        msg = cv.create_text(14, 41, text="可以自动下载并重启，几秒钟就好", anchor="w",
+                             fill=COL["sub"], font=(FN, 8))
+        btn_go = self._popup_btn(cv, 14, 56, 118, 84, "立即更新", COL["ok"])
+        btn_later = self._popup_btn(cv, 126, 56, 190, 84, "以后再说", COL["dim"])
+        cv.create_text(w - 15, 18, text="×", fill=COL["dim"], font=(FN, 11, "bold"), tags=("close",))
+        self._popup_msg = msg
+        self._upd_cv = cv
+
+        def on_click(e):
+            if 14 <= e.x <= 118 and 56 <= e.y <= 84:
+                self.do_update()
+            elif 126 <= e.x <= 190 and 56 <= e.y <= 84:
+                self.cfg["skip_version"] = self.update["version"]
+                save_cfg(self.cfg)
+                self._close_upd_popup()
+            elif e.x >= w - 26 and e.y <= 34:
+                self._close_upd_popup()
+
+        cv.bind("<Button-1>", on_click)
+        self.upd_win = win
+
+    def _round_rect_cv(self, cv, x1, y1, x2, y2, r, **kw):
+        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+               x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+               x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+        return cv.create_polygon(pts, smooth=True, splinesteps=20, **kw)
+
+    def _popup_btn(self, cv, x1, y1, x2, y2, text, col):
+        self._round_rect_cv(cv, x1, y1, x2, y2, 7, fill=COL["line"], outline="")
+        return cv.create_text((x1 + x2) / 2.0, (y1 + y2) / 2.0, text=text,
+                              fill=col, font=(FN, 8, "bold"))
+
+    def _close_upd_popup(self):
+        if self.upd_win is not None:
+            try:
+                self.upd_win.destroy()
+            except Exception:
+                pass
+            self.upd_win = None
+
+    def do_update(self):
+        info = self.update
+        if not info:
+            return
+        if not getattr(sys, "frozen", False):
+            webbrowser.open(info["url"])
+            self._close_upd_popup()
+            messagebox.showinfo(APP_NAME, "当前是源码模式，已在浏览器打开下载页。\n"
+                                          "（用 exe 运行时可以自动更新）")
+            return
+        if not info.get("exe"):
+            webbrowser.open(info["url"])
+            self._close_upd_popup()
+            return
+        if getattr(self, "_upd_cv", None) is not None:
+            try:
+                self._upd_cv.itemconfigure(self._popup_msg,
+                                           text="正在下载 v%s，请稍候…" % info["version"])
+            except Exception:
+                pass
+        threading.Thread(target=self._do_self_update, args=(info,), daemon=True).start()
+
+    def _do_self_update(self, info):
+        dst = os.path.join(tempfile.gettempdir(),
+                           "hs300_update_%s.exe" % info["version"])
+        try:
+            with requests.get(info["exe"], stream=True, timeout=120,
+                              headers={"User-Agent": "hs300-basis-widget/%s" % APP_VERSION}) as r:
+                r.raise_for_status()
+                with open(dst, "wb") as f:
+                    for chunk in r.iter_content(65536):
+                        if chunk:
+                            f.write(chunk)
+            with open(dst, "rb") as f:
+                if f.read(2) != b"MZ":
+                    raise RuntimeError("下载到的不是有效的 exe")
+            if os.path.getsize(dst) < 3 * 1024 * 1024:
+                raise RuntimeError("下载文件不完整")
+            ps = _self_update_cmd(sys.executable, dst)
+            subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                              "-Command", ps], creationflags=0x08000000, close_fds=True)
+            self.q.put(("quit", None))
+        except Exception as e:
+            self.q.put(("upderr", "更新失败：%s" % e))
+
+    def _on_upd_err(self, msg):
+        self._upd_busy = False
+        if getattr(self, "_upd_cv", None) is not None:
+            try:
+                self._upd_cv.itemconfigure(self._popup_msg, text=str(msg)[:34])
+                return
+            except Exception:
+                pass
+        try:
+            messagebox.showwarning(APP_NAME, str(msg))
+        except Exception:
+            pass
 
     def set_topmost(self, on):
         self.topmost = bool(on)
@@ -830,6 +1056,59 @@ class BasisWidget:
             self.root.destroy()
         except Exception:
             pass
+
+
+# ==================================================================
+#                        在线更新
+# ==================================================================
+def _ver_tuple(v):
+    """'v1.2.3' -> (1, 2, 3)"""
+    out = []
+    for p in str(v).strip().lstrip("vV").split("."):
+        n = ""
+        for ch in p:
+            if ch.isdigit():
+                n += ch
+            else:
+                break
+        out.append(int(n) if n else 0)
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out[:3])
+
+
+def fetch_latest_release(timeout=8):
+    """查 GitHub 最新 Release。返回 dict 或 None（没有 Release）。"""
+    r = requests.get(UPDATE_API, timeout=timeout,
+                     headers={"User-Agent": "hs300-basis-widget/%s" % APP_VERSION,
+                              "Accept": "application/vnd.github+json"})
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    j = r.json()
+    exes = [a.get("browser_download_url") for a in (j.get("assets") or [])
+            if str(a.get("name", "")).lower().endswith(".exe")
+            and (a.get("size") or 0) > 3 * 1024 * 1024]
+    return {
+        "version": str(j.get("tag_name", "")).strip().lstrip("vV"),
+        "url": j.get("html_url") or REPO_URL + "/releases",
+        "exe": exes[0] if exes else "",
+        "notes": (j.get("body") or "").strip(),
+    }
+
+
+def _self_update_cmd(dst_exe, new_exe):
+    """生成 PowerShell 脚本：等旧进程退出 -> 覆盖 -> 重启。含中文路径也安全。"""
+    q = lambda s: str(s).replace("'", "''")
+    return (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "$dst='%s';$src='%s';"
+        "for($i=0;$i -lt 60;$i++){"
+        "  try{Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop;break}"
+        "  catch{Start-Sleep -Milliseconds 500}"
+        "};"
+        "if(Test-Path -LiteralPath $dst){Start-Process -FilePath $dst}"
+    ) % (q(dst_exe), q(new_exe))
 
 
 # ==================================================================

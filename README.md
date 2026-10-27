@@ -2,7 +2,7 @@
 
 <p align="center"><img src="docs/logo.png" width="112" alt="logo"></p>
 
-![Version](https://img.shields.io/badge/version-v1.0.0-orange)
+![Version](https://img.shields.io/badge/version-v1.1.0-orange)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![Platform](https://img.shields.io/badge/平台-Windows%2010%2F11-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -39,6 +39,8 @@
 - **自动换月**：按 CFFEX 当前挂牌的合约动态取数，自动跳过已到期合约，不用每月改代码
 - **持仓量加权**：`Σ(最新价 × 持仓量) / Σ持仓量`，对齐文华「300股指加权」口径（**不是**成交量加权）
 - **状态一眼可见**：绿点=实时，黄点=收盘/非交易时段，红点=取数失败重试中
+- **自由缩放**：拖右下角那三道斜线，75% ~ 250% 任意放大缩小，大屏小屏都看得清（缩放比例会记住）
+- **能自己更新**：启动后自动查 GitHub Releases，有新版就在窗口下方弹提示，点「立即更新」自动下载、替换、重启；也能在右键菜单里手动检查
 - **无控制台黑窗**：双击 .py 会自动用 `pythonw` 重启自己
 - **单实例**：重复双击不会开出第二个窗口
 - **记忆**：位置、展开状态、刷新间隔都记住
@@ -46,7 +48,7 @@
 
 ## 下载即用（推荐，不需要装 Python）
 
-到 [Releases](https://github.com/wwwwww1239/hs300-basis-widget/releases) 页面下载 **`eyupai-hs300-basis-v1.0.0.exe`**（约 14 MB，单文件），双击就能用，不用装 Python、不用 pip。
+到 [Releases](https://github.com/wwwwww1239/hs300-basis-widget/releases) 页面下载 **`eyupai-hs300-basis-v1.1.0.exe`**（约 14 MB，单文件），双击就能用，不用装 Python、不用 pip。
 
 > 第一次运行 Windows 可能弹「Windows 已保护你的电脑」→ 点「更多信息」→「仍要运行」。这是没买代码签名证书的正常提示。
 >
@@ -75,8 +77,9 @@ python 鳄鱼派_沪深300基差.py
 | 点右上角 `▾` / `▴` | 展开 / 收起详情 |
 | 双击窗体空白处 | 同样展开 / 收起 |
 | 按住窗体拖动 | 移动位置（退出后位置会记住） |
+| **拖右下角三道斜线** | **整体缩放 75% ~ 250%**（小屏调小、大屏调大，比例会记住） |
 | 点右上角 `✕` | 退出 |
-| 右键 | 菜单：展开/收起、刷新间隔、立即刷新、始终置顶、开机自启动、回到屏幕右上角、退出 |
+| 右键 | 菜单：检查更新、展开/收起、刷新间隔、立即刷新、始终置顶、开机自启动、回到屏幕右上角、退出 |
 
 颜色约定：**红 = 基差为正（期货比现货便宜），绿 = 基差为负（期货比现货贵）**，跟随 A 股习惯。
 
@@ -151,6 +154,11 @@ SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_FRAME
 
 **Q：会被杀毒软件拦吗？**
 脚本只调用了 `user32` 的 4 个函数（取/设窗口样式、置顶、检测最小化），不注入进程、不 Hook 键盘，代码全部可见，可自行审查。开机会在「启动」文件夹里创建一个快捷方式（可在菜单里关掉）。
+「自动更新」只会访问 `api.github.com` 查最新 Release，下载的 exe 会先校验 MZ 头和体积再替换；不想要可以直接点「以后再说」或删掉 `settings.json` 里的 `skip_version`。
+
+**Q：怎么开 / 关自动检查更新？**
+启动 8 秒后自动查一次，之后右键菜单随时可以手动检查。发现新版会在窗口下方弹一个小提示：点「立即更新」→ 下载新 exe → 覆盖旧文件 → 自动重启；点「以后再说」就是跳过这个版本，之后不再打扰。
+源码模式（跑 .py）不会自动替换文件，会帮你打开 Release 页面手动下载。
 
 **Q：想改外观 / 尺寸 / 刷新频率？**
 文件顶部有可调参数：
@@ -172,9 +180,16 @@ pip install pyinstaller
 pyinstaller -F -w -n eyupai-hs300-basis --icon 鳄鱼派.ico --add-data "鳄鱼派.ico;." 鳄鱼派_沪深300基差.py
 ```
 
-生成的 `dist\eyupai-hs300-basis.exe` 可以直接发给别人双击运行（图标就是仓库里的 `鳄鱼派.ico`，源图是那只鳄鱼摆件）。发布到 Releases 时把文件名带上版本号即可，例如 `eyupai-hs300-basis-v1.0.0.exe`。
+生成的 `dist\eyupai-hs300-basis.exe` 可以直接发给别人双击运行（图标就是仓库里的 `鳄鱼派.ico`，源图是那只鳄鱼摆件）。发布到 Releases 时把文件名带上版本号即可，例如 `eyupai-hs300-basis-v1.1.0.exe`。
 
 ## 更新日志
+
+### v1.1.0 (2026-10-28)
+
+- **右下角拖拽缩放**：拖窗口右下角的三道斜线，整体缩放 75% ~ 250%，字号、排版、圆角一起等比放大，比例写入配置
+- **在线更新**：启动 8 秒后自动检查 GitHub Releases；发现新版在窗口下方弹提示，exe 模式点「立即更新」会下载 → 覆盖 → 自动重启；源码模式跳转下载页；支持「以后再说」（跳过该版本）
+- 右键菜单新增「检查更新」/「新版本 vX · 点此更新」
+- 紧凑态右下角时间右移，给缩放抓手让位
 
 ### v1.0.0 (2026-10-27)
 

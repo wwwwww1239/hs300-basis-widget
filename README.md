@@ -8,7 +8,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Deps](https://img.shields.io/badge/依赖-requests%20only-informational)
 
-> **鳄鱼派**出品的巴掌大置顶小窗：只把「沪深300 现货 − 持仓量加权 IF」这一个数钉在屏幕角落。
+> **鳄鱼派粉丝**出品的巴掌大置顶小窗：只把「沪深300 现货 − 持仓量加权 IF」这一个数钉在屏幕角落。
 > **按 Win+D 显示桌面也不会被最小化**（原生实现，不用装 AutoHotkey）。
 
 ![预览](docs/hero.png)

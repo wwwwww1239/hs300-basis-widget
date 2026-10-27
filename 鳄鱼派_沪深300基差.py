@@ -166,7 +166,8 @@ def parse_spot(f):
 def parse_if(code, f):
     """
     CFF_RE_IFxxxx 字段： [0]今开 [1]昨结算 [2]最低 [3]最新 [4]成交量
-                        [6]持仓量 [36]日期 [37]时间 [49]合约名称
+                        [6]持仓量 [14]昨收盘 [36]日期 [37]时间 [49]合约名称
+    涨跌以「昨收盘」为基准 —— 与文华终端显示一致（若昨收缺失才退回昨结算）。
     """
     if not f or len(f) < 38:
         return None
@@ -176,10 +177,17 @@ def parse_if(code, f):
         oi = float(f[6])
         if price <= 0 or (oi <= 0 and volume <= 0):
             return None
+        pre_settle = float(f[1])
+        pre_close = float(f[14]) if len(f) > 14 and f[14] else 0.0
+        if pre_close <= 0:
+            pre_close = pre_settle
+        oi_y = float(f[15]) if len(f) > 15 and f[15] else 0.0
         return {
             "code": code,
             "price": price,
-            "pre_settle": float(f[1]),
+            "pre_settle": pre_settle,
+            "pre_close": pre_close,
+            "oi_y": oi_y,
             "open": float(f[0]),
             "low": float(f[2]),
             "volume": volume,
@@ -218,14 +226,19 @@ def build_snapshot(sess):
         raise RuntimeError("合约持仓为 0")
 
     wp = sum(c["price"] * c["oi"] for c in live) / tot_oi
-    wp_pre = sum(c["pre_settle"] * c["oi"] for c in live) / tot_oi
+    # 加权基准价：文华用「昨日持仓量 × 昨日收盘」加权（换手导致的权重变化不影响当日涨跌）
+    tot_oi_y = sum(c["oi_y"] for c in live)
+    if tot_oi_y > 0:
+        wp_pre = sum(c["pre_close"] * c["oi_y"] for c in live) / tot_oi_y
+    else:
+        wp_pre = sum(c["pre_close"] * c["oi"] for c in live) / tot_oi
 
     rows = []
     for c in live:
         rows.append({
             "code": c["code"],
             "price": c["price"],
-            "chg": c["price"] - c["pre_settle"],
+            "chg": c["price"] - c["pre_close"],
             "oi": c["oi"],
             "vol": c["volume"],
             "w": c["oi"] / tot_oi,
@@ -544,8 +557,7 @@ class BasisWidget:
             if status == "error":
                 col = COL["dim"]
             txt = "%+.2f" % basis
-            sub = "现货升水 · %+.2f%%" % s["basis_pct"] if basis > 0 else \
-                  ("期货升水 · %+.2f%%" % s["basis_pct"] if basis < 0 else "期现平价")
+            sub = "%+.2f%%" % s["basis_pct"]
             sub_col = col
             foot = "%.2f → %.2f" % (s["spot"]["price"], s["wp"])
             tcol = COL["dim"] if status == "stale" else COL["sub"]

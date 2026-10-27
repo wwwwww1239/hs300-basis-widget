@@ -46,9 +46,11 @@
 
 ## 下载即用（推荐，不需要装 Python）
 
-到 [Releases](https://github.com/wwwwww1239/hs300-basis-widget/releases) 页面下载 **`鳄鱼派-沪深300基差.exe`**（约 14 MB，单文件），双击就能用，不用装 Python、不用 pip。
+到 [Releases](https://github.com/wwwwww1239/hs300-basis-widget/releases) 页面下载 **`eyupai-hs300-basis-v1.0.0.exe`**（约 14 MB，单文件），双击就能用，不用装 Python、不用 pip。
 
 > 第一次运行 Windows 可能弹「Windows 已保护你的电脑」→ 点「更多信息」→「仍要运行」。这是没买代码签名证书的正常提示。
+>
+> 附件用英文名是为了兼容性：GitHub 对非 ASCII 文件名偶尔会显示成乱码/截断，所以发布文件统一用 `eyupai-hs300-basis` 这个英文标识（"鳄鱼派" 的拼音），程序本身的窗口标题、图标仍然是中文的鳄鱼派。
 
 ## 快速开始（从源码跑）
 
@@ -167,10 +169,10 @@ EXPANDED_W = 306                   # 展开态宽度
 
 ```bat
 pip install pyinstaller
-pyinstaller -F -w -n 鳄鱼派-沪深300基差 --icon 鳄鱼派.ico --add-data "鳄鱼派.ico;." 鳄鱼派_沪深300基差.py
+pyinstaller -F -w -n eyupai-hs300-basis --icon 鳄鱼派.ico --add-data "鳄鱼派.ico;." 鳄鱼派_沪深300基差.py
 ```
 
-生成的 `dist\鳄鱼派-沪深300基差.exe` 可以直接发给别人双击运行（图标就是仓库里的 `鳄鱼派.ico`，源图是那只鳄鱼摆件）。
+生成的 `dist\eyupai-hs300-basis.exe` 可以直接发给别人双击运行（图标就是仓库里的 `鳄鱼派.ico`，源图是那只鳄鱼摆件）。发布到 Releases 时把文件名带上版本号即可，例如 `eyupai-hs300-basis-v1.0.0.exe`。
 
 ## 更新日志
 

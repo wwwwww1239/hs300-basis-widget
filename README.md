@@ -2,7 +2,7 @@
 
 <p align="center"><img src="docs/logo.png" width="112" alt="logo"></p>
 
-![Version](https://img.shields.io/badge/version-v1.1.0-orange)
+![Version](https://img.shields.io/badge/version-v1.2.0-orange)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![Platform](https://img.shields.io/badge/平台-Windows%2010%2F11-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -39,7 +39,7 @@
 - **自动换月**：按 CFFEX 当前挂牌的合约动态取数，自动跳过已到期合约，不用每月改代码
 - **持仓量加权**：`Σ(最新价 × 持仓量) / Σ持仓量`，对齐文华「300股指加权」口径（**不是**成交量加权）
 - **状态一眼可见**：绿点=实时，黄点=收盘/非交易时段，红点=取数失败重试中
-- **自由缩放**：拖右下角那三道斜线，75% ~ 250% 任意放大缩小，大屏小屏都看得清（缩放比例会记住）
+- **盘前不会算错**：开盘前现货还停在昨天收盘、期货有的已经切到今天，程序自动退回「昨收口径」（现货昨收 − 加权昨收）并在角标标注 `·昨收`；盘中若某个合约掉队，会显示 `·不同步`\n- **自由缩放**：拖右下角那三道斜线，75% ~ 250% 任意放大缩小，大屏小屏都看得清（缩放比例会记住）
 - **能自己更新**：启动后自动查 GitHub Releases，有新版就在窗口下方弹提示，点「立即更新」自动下载、替换、重启；也能在右键菜单里手动检查
 - **无控制台黑窗**：双击 .py 会自动用 `pythonw` 重启自己
 - **单实例**：重复双击不会开出第二个窗口
@@ -48,7 +48,7 @@
 
 ## 下载即用（推荐，不需要装 Python）
 
-到 [Releases](https://github.com/wwwwww1239/hs300-basis-widget/releases) 页面下载 **`eyupai-hs300-basis-v1.1.0.exe`**（约 14 MB，单文件），双击就能用，不用装 Python、不用 pip。
+到 [Releases](https://github.com/wwwwww1239/hs300-basis-widget/releases) 页面下载 **`eyupai-hs300-basis-v1.2.0.exe`**（约 14 MB，单文件），双击就能用，不用装 Python、不用 pip。
 
 > 第一次运行 Windows 可能弹「Windows 已保护你的电脑」→ 点「更多信息」→「仍要运行」。这是没买代码签名证书的正常提示。
 >
@@ -180,9 +180,18 @@ pip install pyinstaller
 pyinstaller -F -w -n eyupai-hs300-basis --icon 鳄鱼派.ico --add-data "鳄鱼派.ico;." 鳄鱼派_沪深300基差.py
 ```
 
-生成的 `dist\eyupai-hs300-basis.exe` 可以直接发给别人双击运行（图标就是仓库里的 `鳄鱼派.ico`，源图是那只鳄鱼摆件）。发布到 Releases 时把文件名带上版本号即可，例如 `eyupai-hs300-basis-v1.1.0.exe`。
+生成的 `dist\eyupai-hs300-basis.exe` 可以直接发给别人双击运行（图标就是仓库里的 `鳄鱼派.ico`，源图是那只鳄鱼摆件）。发布到 Releases 时把文件名带上版本号即可，例如 `eyupai-hs300-basis-v1.2.0.exe`。
 
 ## 更新日志
+
+### v1.2.0 (2026-11-03)
+
+- **修复盘前基差算错**：开盘前现货常常还停在昨天 15:00 的收盘，而 IF 合约已经切到今天，旧逻辑只看期货日期，会把「昨天的现货」和「今天的期货」相减。
+  现在程序判断相位：盘前 / 非交易日一律走**昨收口径**（现货昨收 − 加权昨收），角标显示 `15:00·昨收`
+- **盘中日期以现货为准**：不再用期货的最大日期，日期掉队的合约会被剔除，避免权重被砍
+- **不同步提示**：现货与合约时间戳差超过 120 秒、或有合约被剔除时，角标显示 `·不同步`
+- **更新说明能看了**：更新提示改成一张说明卡片，直接显示该版本的更新内容；底部 `‹ 1 / N ›` 可以左右翻页看历史版本，翻到旧版时按钮变成「打开网页」（不提供降级安装）
+- 更新提示跟随窗口缩放比例
 
 ### v1.1.0 (2026-10-28)
 

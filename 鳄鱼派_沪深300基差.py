@@ -27,6 +27,7 @@ import datetime
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import tempfile
@@ -45,14 +46,18 @@ INTERVAL_CHOICES = (1, 2, 3, 5, 10, 30)
 # =============================================
 
 APP_NAME = "鳄鱼派 沪深300基差"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_TITLE = "%s v%s" % (APP_NAME, APP_VERSION)
 HEAD_TITLE = "鳄鱼派 · 沪深300基差"   # 窗体内左上角标题
 REPO = "wwwwww1239/hs300-basis-widget"
 REPO_URL = "https://github.com/" + REPO
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % REPO
+RELEASES_API = "https://api.github.com/repos/%s/releases?per_page=10" % REPO
 CFG_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "HS300BasisWidget")
 CFG_PATH = os.path.join(CFG_DIR, "settings.json")
+
+UPD_W, UPD_H = 324, 190      # 更新提示浮层尺寸（带更新说明和翻页按钮）
+EDGE_PAD = 8                 # 面板离屏幕边缘留的余量
 
 HEADERS = {
     "Referer": "https://finance.sina.com.cn",
@@ -180,13 +185,14 @@ def parse_if(code, f):
         price = float(f[3])
         volume = float(f[4])
         oi = float(f[6])
-        if price <= 0 or (oi <= 0 and volume <= 0):
+        oi_y = float(f[15]) if len(f) > 15 and f[15] else 0.0
+        # 盘前合约还没成交：持仓/成交量都是 0，但昨持仓还在，不能直接丢掉
+        if price <= 0 or (oi <= 0 and volume <= 0 and oi_y <= 0):
             return None
         pre_settle = float(f[1])
         pre_close = float(f[14]) if len(f) > 14 and f[14] else 0.0
         if pre_close <= 0:
             pre_close = pre_settle
-        oi_y = float(f[15]) if len(f) > 15 and f[15] else 0.0
         return {
             "code": code,
             "price": price,
@@ -205,7 +211,16 @@ def parse_if(code, f):
 
 
 def build_snapshot(sess):
-    """抓一次行情，算出基差。返回 dict；取不到数据时抛异常。"""
+    """抓一次行情，算出基差。返回 dict；取不到数据时抛异常。
+
+    相位 phase：
+      pre   —— 盘前 / 非交易日。现货常常还挂在昨天 15:00 的收盘，
+               而 IF 合约已经切到今天（09:00 就换了日期），
+               此时「今天的期货 − 昨天的现货」全是错的，
+               所以统一退回「昨收口径」：现货昨收 − Σ(昨收×昨持仓)/Σ昨持仓
+      live  —— 盘中且 90 秒内有新数据
+      stale —— 盘中但数据旧了（收盘后 / 断网）
+    """
     codes = get_codes()
     syms = ["sh000300"] + ["CFF_RE_%s" % c.upper() for c in codes]
     raw = fetch_sina(sess, syms)
@@ -222,44 +237,88 @@ def build_snapshot(sess):
     if not cands:
         raise RuntimeError("未取到 IF 合约行情")
 
-    # 只保留「最新行情日」的合约（自动剔除已到期/停牌合约）
-    latest_day = max(c["date"] for c in cands)
-    live = [c for c in cands if c["date"] == latest_day]
+    now = datetime.datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    spot_day = spot["date"]
 
-    tot_oi = sum(c["oi"] for c in live)
-    if tot_oi <= 0:
-        raise RuntimeError("合约持仓为 0")
+    try:
+        data_dt = datetime.datetime.strptime("%s %s" % (spot["date"], spot["time"]),
+                                             "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        data_dt = now
 
-    wp = sum(c["price"] * c["oi"] for c in live) / tot_oi
-    # 加权基准价：文华用「昨日持仓量 × 昨日收盘」加权（换手导致的权重变化不影响当日涨跌）
-    tot_oi_y = sum(c["oi_y"] for c in live)
-    if tot_oi_y > 0:
-        wp_pre = sum(c["pre_close"] * c["oi_y"] for c in live) / tot_oi_y
+    # 现货日期是不是「今天」，决定这一刻到底算不算盘中
+    same_day = spot_day >= today
+    phase = "live" if (same_day and (now - data_dt).total_seconds() <= 90) else (
+        "stale" if same_day else "pre")
+
+    # 盘中：以现货的日期为准（不再用期货的 max，免得合约日期参差时权重被砍）
+    live = cands
+    if same_day:
+        live = [c for c in cands if c["date"] == spot_day]
+        if not live:                       # 期货全停在昨天 -> 按盘前处理
+            phase = "pre"
+
+    drop_n = 0
+    if phase == "pre":
+        # 昨收口径：只用昨收价 + 昨日持仓，两个数天然同一天同一时刻
+        live = [c for c in cands if c["oi_y"] > 0] or cands
+        wts = [(c["oi_y"] or c["oi"], c) for c in live]
+        tot_oi = sum(w for w, _ in wts)
+        if tot_oi <= 0:
+            raise RuntimeError("合约持仓为 0")
+        wp = sum(c["pre_close"] * w for w, c in wts) / tot_oi
+        wp_pre = wp
+        spot_px = spot["preclose"]
     else:
-        wp_pre = sum(c["pre_close"] * c["oi"] for c in live) / tot_oi
+        drop_n = len(cands) - len(live)
+        wts = [(c["oi"], c) for c in live]
+        tot_oi = sum(w for w, _ in wts)
+        if tot_oi <= 0:
+            raise RuntimeError("合约持仓为 0")
+        wp = sum(c["price"] * w for w, c in wts) / tot_oi
+        # 加权基准价：文华用「昨日持仓量 × 昨日收盘」加权（换手导致的权重变化不影响当日涨跌）
+        tot_oi_y = sum(c["oi_y"] for c in live)
+        if tot_oi_y > 0:
+            wp_pre = sum(c["pre_close"] * c["oi_y"] for c in live) / tot_oi_y
+        else:
+            wp_pre = sum(c["pre_close"] * c["oi"] for c in live) / tot_oi
+        spot_px = spot["price"]
 
     rows = []
-    for c in live:
+    for w, c in wts:
+        px = c["pre_close"] if phase == "pre" else c["price"]
         rows.append({
             "code": c["code"],
-            "price": c["price"],
-            "chg": c["price"] - c["pre_close"],
-            "oi": c["oi"],
+            "price": px,
+            "chg": px - c["pre_close"],
+            "oi": c["oi_y"] if (phase == "pre" and c["oi_y"]) else c["oi"],
             "vol": c["volume"],
-            "w": c["oi"] / tot_oi,
+            "w": w / tot_oi,
         })
     rows.sort(key=lambda r: -r["oi"])
 
-    basis = spot["price"] - wp
-    basis_pct = basis / spot["price"] * 100.0
+    basis = spot_px - wp
+    basis_pct = basis / spot_px * 100.0 if spot_px else 0.0
 
-    try:
-        data_dt = datetime.datetime.strptime("%s %s" % (spot["date"], spot["time"]), "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        data_dt = datetime.datetime.now()
+    # 盘中：现货与各合约时间戳的最大偏差（秒），>120 秒基本就是有一侧没跟上
+    skew = 0
+    if phase != "pre":
+        def _sec(t):
+            try:
+                return int(t[0:2]) * 3600 + int(t[3:5]) * 60 + int(t[6:8])
+            except (ValueError, IndexError, TypeError):
+                return None
+        s0 = _sec(spot["time"])
+        if s0 is not None:
+            for c in live:
+                s1 = _sec(c["time"])
+                if s1 is not None and s1 > 0:
+                    skew = max(skew, abs(s1 - s0))
 
-    now = datetime.datetime.now()
-    live_flag = (now - data_dt).total_seconds() <= 90 and _in_trading_hours(now)
+    if phase == "pre":
+        spot = dict(spot)
+        spot["price"] = spot_px
 
     return {
         "spot": spot,
@@ -272,7 +331,10 @@ def build_snapshot(sess):
         "basis_pct": basis_pct,
         "tot_oi": tot_oi,
         "data_dt": data_dt,
-        "live": live_flag,
+        "phase": phase,
+        "live": phase == "live",
+        "skew": skew,
+        "drop_n": drop_n,
         "ts": now,
     }
 
@@ -457,6 +519,8 @@ class BasisWidget:
         self.resize = None
         self.autostart_var = None
         self.update = None          # 发现的可用新版本
+        self.releases = []          # 最近几个版本（含更新说明），弹窗左右翻页用
+        self.upd_idx = 0            # 当前翻到第几个
         self.upd_win = None         # 更新提示小窗
         self._upd_busy = False
 
@@ -489,6 +553,7 @@ class BasisWidget:
                 or x > sw - 40 or y > sh - 40:
             x, y = sw - COMPACT_W - 60, 90
         self.pos = [x, y]
+        self._last_size = None            # 上一次实际尺寸，用来判断展开时该往哪边长
 
         self.cv = tk.Canvas(root, bg=TRANSPARENT_KEY, highlightthickness=0, bd=0,
                             width=COMPACT_W, height=COMPACT_H)
@@ -520,14 +585,31 @@ class BasisWidget:
             return EXPANDED_W, 286 + 20 * n
         return COMPACT_W, COMPACT_H
 
-    def _apply_geometry(self):
+    def _apply_geometry(self, anchor=True):
+        """anchor=True：贴边时保持「靠边的那条边」不动，朝屏幕内部长，
+        这样点开详情不会把整个面板挤到旁边，收起后也会回到原位。"""
         w, h = self._size()
         w = int(round(w * self.S))
         h = int(round(h * self.S))
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        self.pos[0] = max(-10, min(self.pos[0], sw - w + 10))
-        self.pos[1] = max(-10, min(self.pos[1], sh - h + 10))
-        self.root.geometry("%dx%d+%d+%d" % (w, h, self.pos[0], self.pos[1]))
+        pad = EDGE_PAD
+        pw, ph = self._last_size if self._last_size else (w, h)
+        x, y = self.pos[0], self.pos[1]
+        if anchor:
+            if x + w > sw - pad:                 # 右边放不下 -> 右边缘对齐，向左长
+                x = max(pad, min(x + (pw - w), sw - w - pad))
+            if y + h > sh - pad:                 # 下边放不下 -> 下边缘对齐，向上长
+                y = max(pad, min(y + (ph - h), sh - h - pad))
+        if x + w > sw - pad:                     # 屏幕都装不下，只能贴左/上
+            x = pad
+        if y + h > sh - pad:
+            y = pad
+        if x < -10:
+            x = -10
+        if y < -10:
+            y = -10
+        self._last_size = (w, h)
+        self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
         try:
             self.root.update_idletasks()
         except Exception:
@@ -561,7 +643,7 @@ class BasisWidget:
                          fill=COL["bg"], outline=COL["line"], width=1)
 
         # --- 头部 ---
-        dot_col = {"live": COL["ok"], "stale": COL["warn"],
+        dot_col = {"live": COL["ok"], "stale": COL["warn"], "pre": COL["sub"],
                    "error": COL["err"], "init": COL["dim"]}.get(status, COL["dim"])
         cv.create_oval(13, 16, 20, 23, fill=dot_col, outline="")
         cv.create_text(26, 20, text=HEAD_TITLE, anchor="w", fill=COL["sub"],
@@ -579,8 +661,14 @@ class BasisWidget:
             sub = "%+.2f%%" % s["basis_pct"]
             sub_col = col
             foot = "%.2f → %.2f" % (s["spot"]["price"], s["wp"])
-            tcol = COL["dim"] if status == "stale" else COL["sub"]
-            tail = s["data_dt"].strftime("%H:%M:%S") + ("" if status == "live" else "·收盘")
+            tcol = COL["dim"] if status in ("stale", "pre") else COL["sub"]
+            tail = s["data_dt"].strftime("%H:%M")
+            if status == "pre":
+                tail += "·昨收"
+            elif status == "stale":
+                tail += "·收盘" if not _in_trading_hours(s["data_dt"]) else "·延迟"
+            elif s.get("skew", 0) > 120 or s.get("drop_n", 0) > 0:
+                tail += "·不同步"
         else:
             col, txt = COL["dim"], "--.--"
             sub = "行情获取失败，重试中…" if self.err else "正在获取行情…"
@@ -681,7 +769,7 @@ class BasisWidget:
             return "error"
         if self.snap is None:
             return "init"
-        return "live" if self.snap.get("live") else "stale"
+        return self.snap.get("phase") or ("live" if self.snap.get("live") else "stale")
 
     def _poll(self):
         if not self.alive:
@@ -766,10 +854,14 @@ class BasisWidget:
                 ns = (bw * s0 + dx) / float(bw)
             else:
                 ns = (bh * s0 + dy) / float(bh)
+            # 拖到什么程度就长多大，但不许把窗口顶出屏幕（左上角固定不动）
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            ns = min(ns, (sw - EDGE_PAD - self.root.winfo_x()) / float(bw),
+                     (sh - EDGE_PAD - self.root.winfo_y()) / float(bh))
             ns = min(2.5, max(0.75, ns))
             if abs(ns - self.S) >= 0.005:
                 self.S = round(ns, 3)
-                self._apply_geometry()
+                self._apply_geometry(anchor=False)
                 self.render()
             return
         if self.drag is None:
@@ -798,7 +890,7 @@ class BasisWidget:
         self.expanded = not self.expanded
         self.cfg["expanded"] = self.expanded
         save_cfg(self.cfg)
-        self._apply_geometry()
+        self._apply_geometry(anchor=True)     # 贴边展开时朝屏幕里长，不把面板挤走
         self.render()
 
     def _build_menu(self):
@@ -856,34 +948,36 @@ class BasisWidget:
 
         def job():
             try:
-                info = fetch_latest_release()
+                rels = fetch_releases()
             except Exception as e:
-                info = ("err", str(e))
-            if isinstance(info, tuple):
-                self.q.put(("upderr", info[1]))
+                rels = ("err", str(e))
+            if isinstance(rels, tuple):
+                self.q.put(("upderr", rels[1]))
             else:
-                self.q.put(("update", (info, manual)))
+                self.q.put(("update", (rels, manual)))
 
         threading.Thread(target=job, daemon=True).start()
 
-    def _on_update_info(self, info, manual):
+    def _on_update_info(self, rels, manual):
         self._upd_busy = False
-        if info is None:
+        if not rels:
             if manual:
-                messagebox.showinfo(APP_NAME, "还没有发布任何 Release，暂时无法检查更新。")
+                messagebox.showinfo(APP_NAME, "没查到 Release：可能没发布，或网络连不上 GitHub。")
             return
-        newer = _ver_tuple(info["version"]) > _ver_tuple(APP_VERSION)
-        if not newer:
+        latest = rels[0]
+        if _ver_tuple(latest["version"]) <= _ver_tuple(APP_VERSION):
             if manual:
                 messagebox.showinfo(APP_NAME, "当前已是最新版本 v%s。" % APP_VERSION)
             return
-        if self.cfg.get("skip_version") == info["version"]:
+        if self.cfg.get("skip_version") == latest["version"]:
             return
-        self.update = info
+        self.releases = rels
+        self.upd_idx = 0
+        self.update = latest
         self._show_update_popup()
 
     def _show_update_popup(self):
-        if not self.update:
+        if not self.releases:
             return
         if self.upd_win is not None:
             try:
@@ -891,7 +985,7 @@ class BasisWidget:
             except Exception:
                 pass
             self.upd_win = None
-        w, h = 244, 96
+        w, h = int(UPD_W * self.S), int(UPD_H * self.S)
         win = tk.Toplevel(self.root)
         win.overrideredirect(True)
         win.attributes("-topmost", True)
@@ -901,38 +995,112 @@ class BasisWidget:
         except Exception:
             win.configure(bg=COL["bg"])
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        x = max(0, min(self.pos[0], sw - w))
-        y = self.pos[1] + int(self.H * self.S) + 8
+        # 用窗口的实际位置（贴边展开时 self.pos 可能和真实坐标不一样）
+        try:
+            wx, wy = self.root.winfo_x(), self.root.winfo_y()
+            ww, wh = self.root.winfo_width(), self.root.winfo_height()
+        except Exception:
+            wx, wy, ww = self.pos[0], self.pos[1], int(self.W * self.S)
+            wh = int(self.H * self.S)
+        x = max(0, min(wx, sw - w))
+        y = wy + wh + 8
         if y + h > sh - 40:
-            y = max(0, self.pos[1] - h - 8)
+            y = max(0, wy - h - 8)
         win.geometry("%dx%d+%d+%d" % (w, h, x, y))
 
         cv = tk.Canvas(win, bg=TRANSPARENT_KEY, highlightthickness=0, bd=0)
         cv.pack(fill="both", expand=True)
+        cv.bind("<Button-1>", self._on_upd_click)
+        self._upd_cv = cv
+        self.upd_win = win
+        self._render_upd_popup()
+        # 先画完再挂图标，保证首帧就有内容
+        try:
+            _apply_icon(win)
+        except Exception:
+            pass
+
+    def _render_upd_popup(self):
+        cv = self._upd_cv
+        if cv is None or not self.releases:
+            return
+        cv.delete("all")
+        w, h = UPD_W, UPD_H
+        it = self.releases[self.upd_idx]
+        newest = (self.upd_idx == 0)
         self._round_rect_cv(cv, 0.5, 0.5, w - 0.5, h - 0.5, 10,
                             fill=COL["bg2"], outline=COL["line"], width=1)
-        cv.create_text(14, 20, text="发现新版本 v%s" % self.update["version"], anchor="w",
-                       fill=COL["fg"], font=(FN, 10, "bold"))
-        msg = cv.create_text(14, 41, text="可以自动下载并重启，几秒钟就好", anchor="w",
-                             fill=COL["sub"], font=(FN, 8))
-        btn_go = self._popup_btn(cv, 14, 56, 118, 84, "立即更新", COL["ok"])
-        btn_later = self._popup_btn(cv, 126, 56, 190, 84, "以后再说", COL["dim"])
-        cv.create_text(w - 15, 18, text="×", fill=COL["dim"], font=(FN, 11, "bold"), tags=("close",))
-        self._popup_msg = msg
-        self._upd_cv = cv
+        title = ("发现新版本 v%s" % it["version"]) if newest else ("v%s · 更新说明" % it["version"])
+        cv.create_text(14, 20, text=title, anchor="w", fill=COL["fg"],
+                       font=(FN, 10, "bold"))
+        cv.create_text(w - 16, 19, text="×", fill=COL["dim"],
+                       font=(FN, 11, "bold"), tags=("close",))
+        meta = [x for x in (it.get("date"), "最新" if newest else
+                            ("当前安装版" if it["version"] == APP_VERSION else "")) if x]
+        cv.create_text(14, 38, text=" · ".join(meta), anchor="w", fill=COL["dim"],
+                       font=(FN, 7))
 
-        def on_click(e):
-            if 14 <= e.x <= 118 and 56 <= e.y <= 84:
-                self.do_update()
-            elif 126 <= e.x <= 190 and 56 <= e.y <= 84:
-                self.cfg["skip_version"] = self.update["version"]
+        by = h - 40
+        notes = it.get("notes") or "（这个版本没填更新说明）"
+        tid = cv.create_text(14, 54, text=notes, anchor="nw", width=w - 28,
+                             justify="left", fill=COL["sub"], font=(FN, 8))
+        for _ in range(14):                      # 说明太长就截断，别压到按钮上
+            try:
+                bb = cv.bbox(tid)
+            except Exception:
+                break
+            if not bb or bb[3] <= by - 10:
+                break
+            notes = notes[:max(14, int(len(notes) * 0.86))].rstrip() + "…"
+            cv.itemconfigure(tid, text=notes)
+        self._popup_msg = tid
+
+        self._popup_btn(cv, 14, by, 128, by + 26,
+                        "立即更新" if newest else "打开网页",
+                        COL["ok"] if newest else COL["sub"])
+        self._popup_btn(cv, 134, by, 206, by + 26, "以后再说", COL["dim"])
+        cv.create_text(232, by + 13, text="‹", tags=("prev",),
+                       fill=COL["fg"] if self.upd_idx > 0 else COL["dim"],
+                       font=(FN, 13, "bold"))
+        cv.create_text(258, by + 13, text="%d / %d" % (self.upd_idx + 1, len(self.releases)),
+                       fill=COL["dim"], font=(FN, 7))
+        cv.create_text(300, by + 13, text="›", tags=("next",),
+                       fill=COL["fg"] if self.upd_idx < len(self.releases) - 1 else COL["dim"],
+                       font=(FN, 13, "bold"))
+        if self.S != 1.0:
+            cv.scale("all", 0, 0, self.S, self.S)
+
+    def _on_upd_click(self, e):
+        s = self.S or 1.0
+        ex, ey = e.x / s, e.y / s          # 画布按 S 整体放大过，判断前先缩回来
+        w, h = UPD_W, UPD_H
+        by = h - 40
+        if by <= ey <= by + 26:
+            if 14 <= e.x <= 128:
+                if self.upd_idx == 0:
+                    self.update = self.releases[0]
+                    self.do_update()
+                else:
+                    webbrowser.open(self.releases[self.upd_idx]["url"])
+                return
+            if 134 <= e.x <= 206:
+                self.cfg["skip_version"] = self.releases[0]["version"]
                 save_cfg(self.cfg)
                 self._close_upd_popup()
-            elif e.x >= w - 26 and e.y <= 34:
-                self._close_upd_popup()
+                return
+            if 215 <= e.x <= 245:
+                if self.upd_idx > 0:
+                    self.upd_idx -= 1
+                    self._render_upd_popup()
+                return
+            if e.x >= 285:
+                if self.upd_idx < len(self.releases) - 1:
+                    self.upd_idx += 1
+                    self._render_upd_popup()
+                return
+        if e.x >= w - 30 and e.y <= 34:
+            self._close_upd_popup()
 
-        cv.bind("<Button-1>", on_click)
-        self.upd_win = win
 
     def _round_rect_cv(self, cv, x1, y1, x2, y2, r, **kw):
         pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
@@ -1077,24 +1245,81 @@ def _ver_tuple(v):
     return tuple(out[:3])
 
 
+def _clean_notes(text, limit=400):
+    """把 Release 的 markdown 正文压成几行纯文本。"""
+    if not text:
+        return ""
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    t = t.replace("**", "").replace("__", "").replace("`", "")
+    out = []
+    for ln in t.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("<!--") or ln.startswith("```"):
+            continue
+        ln = ln.lstrip("#").strip()
+        ln = re.sub(r"^[-*+]\s+", "· ", ln)
+        if ln:
+            out.append(ln)
+        if len("\n".join(out)) > limit:
+            break
+    s = "\n".join(out).strip()
+    return (s[:limit] + "…") if len(s) > limit else s
+
+
+def fetch_releases(timeout=8):
+    """最近 10 个 Release（含更新说明）-> [{version,notes,url,exe,date}]，新到旧。
+
+    结果缓存 1 小时，避免每次启动都打 GitHub API（未登录限 60 次/小时）。
+    """
+    cache_path = os.path.join(CFG_DIR, "releases.json")
+    try:
+        if os.path.exists(cache_path):
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            if time.time() - float(cache.get("ts") or 0) < 3600:
+                if cache.get("list"):
+                    return cache["list"]
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        r = requests.get(RELEASES_API, timeout=timeout,
+                         headers={"User-Agent": "hs300-basis-widget/%s" % APP_VERSION,
+                                  "Accept": "application/vnd.github+json"})
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return []
+    out = []
+    for it in data if isinstance(data, list) else []:
+        if not isinstance(it, dict) or it.get("draft"):
+            continue
+        exes = [a.get("browser_download_url") for a in (it.get("assets") or [])
+                if str(a.get("name", "")).lower().endswith(".exe")
+                and (a.get("size") or 0) > 3 * 1024 * 1024]
+        out.append({
+            "version": str(it.get("tag_name", "")).strip().lstrip("vV"),
+            "name": it.get("name") or "",
+            "notes": _clean_notes(it.get("body") or ""),
+            "url": it.get("html_url") or REPO_URL + "/releases",
+            "exe": exes[0] if exes else "",
+            "date": str(it.get("published_at") or "")[:10],
+        })
+    if not out:
+        return []
+    out.sort(key=lambda x: _ver_tuple(x["version"]), reverse=True)
+    try:
+        os.makedirs(CFG_DIR, exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time(), "list": out}, f)
+    except OSError:
+        pass
+    return out
+
+
 def fetch_latest_release(timeout=8):
-    """查 GitHub 最新 Release。返回 dict 或 None（没有 Release）。"""
-    r = requests.get(UPDATE_API, timeout=timeout,
-                     headers={"User-Agent": "hs300-basis-widget/%s" % APP_VERSION,
-                              "Accept": "application/vnd.github+json"})
-    if r.status_code == 404:
-        return None
-    r.raise_for_status()
-    j = r.json()
-    exes = [a.get("browser_download_url") for a in (j.get("assets") or [])
-            if str(a.get("name", "")).lower().endswith(".exe")
-            and (a.get("size") or 0) > 3 * 1024 * 1024]
-    return {
-        "version": str(j.get("tag_name", "")).strip().lstrip("vV"),
-        "url": j.get("html_url") or REPO_URL + "/releases",
-        "exe": exes[0] if exes else "",
-        "notes": (j.get("body") or "").strip(),
-    }
+    """兼容旧调用：只要最新一个。"""
+    rels = fetch_releases(timeout)
+    return rels[0] if rels else None
 
 
 def _self_update_cmd(dst_exe, new_exe):

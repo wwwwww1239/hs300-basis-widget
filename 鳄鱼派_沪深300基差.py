@@ -526,6 +526,13 @@ class BasisWidget:
         self.upd_win = None         # 更新提示小窗
         self._upd_busy = False
         self._updating = False      # 正在下载/安装更新
+        self._upd_mode = "info"     # info = 看说明 / progress = 下载中
+        self._upd_cancel = False    # 用户点了「取消下载」
+        self._upd_done = 0
+        self._upd_total = 0
+        self._upd_t0 = 0.0
+        self._upd_redraw = 0.0
+        self._upd_status = ""       # 进度条下方的状态行
 
         try:
             self.S = min(2.5, max(0.75, float(self.cfg.get("scale", 1.0) or 1.0)))
@@ -787,6 +794,13 @@ class BasisWidget:
                     dirty = True
                 elif kind == "update":
                     self._on_update_info(payload[0], payload[1])
+                elif kind == "progress":
+                    self._upd_done, self._upd_total = payload
+                    self._refresh_progress()
+                elif kind == "installing":
+                    self._on_upd_installing()
+                elif kind == "upd_cancel":
+                    self._on_upd_cancelled()
                 elif kind == "upderr":
                     self._on_upd_err(payload)
                 elif kind == "quit":
@@ -1028,6 +1042,11 @@ class BasisWidget:
         if cv is None or not self.releases:
             return
         cv.delete("all")
+        if self._upd_mode == "progress":
+            self._render_upd_progress(cv)
+            if self.S != 1.0:
+                cv.scale("all", 0, 0, self.S, self.S)
+            return
         w, h = UPD_W, UPD_H
         it = self.releases[self.upd_idx]
         newest = (self.upd_idx == 0)
@@ -1073,35 +1092,88 @@ class BasisWidget:
         if self.S != 1.0:
             cv.scale("all", 0, 0, self.S, self.S)
 
+    def _refresh_progress(self):
+        now = time.time()
+        if now - self._upd_redraw < 0.08:      # 刷新节流，别把界面刷爆
+            return
+        self._upd_redraw = now
+        if self.upd_win is None:
+            return
+        try:
+            self._render_upd_popup()
+        except Exception:
+            pass
+
+    def _render_upd_progress(self, cv):
+        w, h = UPD_W, UPD_H
+        it = self.releases[0]
+        total = float(self._upd_total or 0)
+        done = float(min(self._upd_done, total)) if total else float(self._upd_done)
+        ratio = (done / total) if total > 0 else 0.0
+        ratio = max(0.0, min(1.0, ratio))
+        self._round_rect_cv(cv, 0.5, 0.5, w - 0.5, h - 0.5, 10,
+                            fill=COL["bg2"], outline=COL["line"], width=1)
+        cv.create_text(14, 20, text="正在更新到 v%s" % it.get("version", ""),
+                       anchor="w", fill=COL["fg"], font=(FN, 10, "bold"))
+        cv.create_text(w / 2.0, 62, text="%d%%" % int(round(ratio * 100)),
+                       anchor="center", fill=COL["fg"], font=(FNUM, 22, "bold"))
+        bx1, bx2, by1, by2 = 20, w - 20, 90, 98
+        self._round_rect_cv(cv, bx1, by1, bx2, by2, 4,
+                            fill="#1b2230", outline="", width=0)
+        if ratio > 0.001:
+            self._round_rect_cv(cv, bx1, by1, bx1 + max(8.0, (bx2 - bx1) * ratio), by2, 4,
+                                fill=COL["ok"], outline="", width=0)
+
+        def _mb(n):
+            return "%.1f" % (n / 1048576.0)
+        speed = ""
+        el = time.time() - (self._upd_t0 or time.time())
+        if el > 0.8 and done < total:
+            speed = "   ·   %.1f MB/s" % (done / 1048576.0 / el)
+        cv.create_text(20, 114, anchor="w", fill=COL["sub"], font=(FN, 8),
+                       text="%s / %s MB%s" % (_mb(done), _mb(total), speed))
+        if ratio >= 0.999:
+            cv.create_text(w / 2.0, h - 56,
+                           text=self._upd_status or "下载完成，正在重启…",
+                           anchor="center", fill=COL["ok"], font=(FN, 8))
+        else:
+            self._popup_btn(cv, w / 2.0 - 52, h - 44, w / 2.0 + 52, h - 16,
+                            "取消", COL["dim"])
+        self._popup_msg = None
+
     def _on_upd_click(self, e):
         s = self.S or 1.0
         ex, ey = e.x / s, e.y / s          # 画布按 S 整体放大过，判断前先缩回来
         w, h = UPD_W, UPD_H
+        if self._upd_mode == "progress":   # 下载中只认「取消」按钮
+            if h - 48 <= ey <= h - 12 and abs(ex - w / 2.0) <= 60:
+                self._on_upd_cancel_click()
+            return
         by = h - 40
         if by <= ey <= by + 26:
-            if 14 <= e.x <= 128:
+            if 14 <= ex <= 128:
                 if self.upd_idx == 0:
                     self.update = self.releases[0]
                     self.do_update()
                 else:
                     webbrowser.open(self.releases[self.upd_idx]["url"])
                 return
-            if 134 <= e.x <= 206:
+            if 134 <= ex <= 206:
                 self.cfg["skip_version"] = self.releases[0]["version"]
                 save_cfg(self.cfg)
                 self._close_upd_popup()
                 return
-            if 215 <= e.x <= 245:
+            if 212 <= ex <= 246:
                 if self.upd_idx > 0:
                     self.upd_idx -= 1
                     self._render_upd_popup()
                 return
-            if e.x >= 285:
+            if ex >= 282:
                 if self.upd_idx < len(self.releases) - 1:
                     self.upd_idx += 1
                     self._render_upd_popup()
                 return
-        if e.x >= w - 30 and e.y <= 34:
+        if ex >= w - 30 and ey <= 34:
             self._close_upd_popup()
 
 
@@ -1141,19 +1213,33 @@ class BasisWidget:
             self._close_upd_popup()
             return
         self._updating = True
-        if getattr(self, "_upd_cv", None) is not None:
-            try:
-                self._upd_cv.itemconfigure(self._popup_msg,
-                                           text="正在下载 v%s，请稍候…" % info["version"])
-            except Exception:
-                pass
+        self._upd_mode = "progress"
+        self._upd_cancel = False
+        self._upd_done = 0
+        self._upd_total = int(info.get("size") or 0)
+        self._upd_t0 = time.time()
+        self._upd_status = ""          # 清掉上一轮的「正在安装」
+        self._render_upd_popup()
         threading.Thread(target=self._do_self_update, args=(info,), daemon=True).start()
+
+    def _upd_progress(self, done, total):
+        """下载进度回调（跑在下载线程里，只往队列丢，界面在主线程刷）。"""
+        self.q.put(("progress", (done, total)))
+
+    def _upd_cancelled(self):
+        return bool(self._upd_cancel)
 
     def _do_self_update(self, info):
         try:
             tmp = os.path.join(tempfile.gettempdir(),
                                "hs300_update_%s_%d.exe" % (info["version"], os.getpid()))
-            download_release_asset(info, tmp)
+            download_release_asset(info, tmp,
+                                   on_progress=self._upd_progress,
+                                   should_cancel=self._upd_cancelled)
+            # 下载完 -> 先切到「正在安装」，让用户看到进度条走满
+            self.q.put(("progress", (os.path.getsize(tmp), os.path.getsize(tmp))))
+            self.q.put(("installing", None))
+            time.sleep(0.5)
             # 装到旧 exe 旁边、用带版本号的新文件名：
             # 绝不覆盖正在运行的自己（覆盖会让新进程读到半截文件，报 python313.dll 解压失败）
             src_exe = os.path.abspath(sys.executable)
@@ -1169,11 +1255,42 @@ class BasisWidget:
             subprocess.Popen([new_exe], cwd=target_dir, close_fds=True)
             self.q.put(("quit", None))
         except Exception as e:
-            self.q.put(("upderr", "更新失败：%s" % e))
+            if "已取消" in str(e):
+                self.q.put(("upd_cancel", None))
+            else:
+                self.q.put(("upderr", "更新失败：%s" % e))
+
+    def _on_upd_cancel_click(self):
+        self._upd_cancel = True
+        try:
+            self._upd_cv.itemconfigure(self._popup_msg, text="正在取消…")
+        except Exception:
+            pass
+
+    def _on_upd_cancelled(self):
+        self._upd_busy = False
+        self._updating = False
+        self._upd_cancel = False
+        self._upd_mode = "info"
+        self._render_upd_popup()
+
+    def _on_upd_installing(self):
+        self._upd_mode = "progress"
+        self._upd_done = self._upd_total
+        self._upd_status = "正在安装，程序即将重启…"
+        try:
+            self._render_upd_popup()
+        except Exception:
+            pass
 
     def _on_upd_err(self, msg):
         self._upd_busy = False
         self._updating = False      # 正在下载/安装更新
+        self._upd_mode = "info"     # 回到说明卡片，别把错误挤在进度条里
+        try:
+            self._render_upd_popup()
+        except Exception:
+            pass
         if getattr(self, "_upd_cv", None) is not None:
             try:
                 self._upd_cv.itemconfigure(self._popup_msg, text=str(msg)[:34])
@@ -1355,10 +1472,11 @@ def _verify_download(path, info):
     return True
 
 
-def download_release_asset(info, dst, attempts=3):
-    """下载 Release 附件到 dst，带校验和重试。返回 True/抛异常。"""
+def download_release_asset(info, dst, attempts=3, on_progress=None, should_cancel=None):
+    """下载 Release 附件到 dst，带进度回调、校验和重试。返回 True / 抛异常。"""
     urls = [u for u in (info.get("exe"), info.get("api_exe")) if u]
     last = None
+    total = int(info.get("size") or 0)
     for url in urls:
         api = "api.github.com" in url
         for _ in range(attempts):
@@ -1367,16 +1485,29 @@ def download_release_asset(info, dst, attempts=3):
                            "Accept-Encoding": "identity"}   # 别让代理压缩二进制
                 if api:
                     headers["Accept"] = "application/octet-stream"
+                done = 0
                 with requests.get(url, stream=True, timeout=180, headers=headers) as r:
                     r.raise_for_status()
+                    clen = int(r.headers.get("Content-Length") or 0)
+                    if clen:
+                        total = clen
                     with open(dst, "wb") as f:
                         for chunk in r.iter_content(65536):
+                            if should_cancel is not None and should_cancel():
+                                raise RuntimeError("已取消")
                             if chunk:
                                 f.write(chunk)
+                                done += len(chunk)
+                                if on_progress is not None:
+                                    on_progress(done, total)
                 _verify_download(dst, info)
+                if on_progress is not None:
+                    on_progress(total or os.path.getsize(dst), total or os.path.getsize(dst))
                 return True
             except Exception as e:
                 last = e
+                if "已取消" in str(e):
+                    raise
                 try:
                     if os.path.exists(dst):
                         os.remove(dst)

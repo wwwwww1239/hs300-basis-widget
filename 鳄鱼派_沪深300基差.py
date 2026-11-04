@@ -24,10 +24,12 @@ License: MIT
 
 import ctypes
 import datetime
+import hashlib
 import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,7 +48,7 @@ INTERVAL_CHOICES = (1, 2, 3, 5, 10, 30)
 # =============================================
 
 APP_NAME = "鳄鱼派 沪深300基差"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 APP_TITLE = "%s v%s" % (APP_NAME, APP_VERSION)
 HEAD_TITLE = "鳄鱼派 · 沪深300基差"   # 窗体内左上角标题
 REPO = "wwwwww1239/hs300-basis-widget"
@@ -523,6 +525,7 @@ class BasisWidget:
         self.upd_idx = 0            # 当前翻到第几个
         self.upd_win = None         # 更新提示小窗
         self._upd_busy = False
+        self._updating = False      # 正在下载/安装更新
 
         try:
             self.S = min(2.5, max(0.75, float(self.cfg.get("scale", 1.0) or 1.0)))
@@ -1125,6 +1128,8 @@ class BasisWidget:
         info = self.update
         if not info:
             return
+        if self._updating:          # 防止重复点，两个线程同时写同一个临时文件会把它写坏
+            return
         if not getattr(sys, "frozen", False):
             webbrowser.open(info["url"])
             self._close_upd_popup()
@@ -1135,6 +1140,7 @@ class BasisWidget:
             webbrowser.open(info["url"])
             self._close_upd_popup()
             return
+        self._updating = True
         if getattr(self, "_upd_cv", None) is not None:
             try:
                 self._upd_cv.itemconfigure(self._popup_msg,
@@ -1144,30 +1150,30 @@ class BasisWidget:
         threading.Thread(target=self._do_self_update, args=(info,), daemon=True).start()
 
     def _do_self_update(self, info):
-        dst = os.path.join(tempfile.gettempdir(),
-                           "hs300_update_%s.exe" % info["version"])
         try:
-            with requests.get(info["exe"], stream=True, timeout=120,
-                              headers={"User-Agent": "hs300-basis-widget/%s" % APP_VERSION}) as r:
-                r.raise_for_status()
-                with open(dst, "wb") as f:
-                    for chunk in r.iter_content(65536):
-                        if chunk:
-                            f.write(chunk)
-            with open(dst, "rb") as f:
-                if f.read(2) != b"MZ":
-                    raise RuntimeError("下载到的不是有效的 exe")
-            if os.path.getsize(dst) < 3 * 1024 * 1024:
-                raise RuntimeError("下载文件不完整")
-            ps = _self_update_cmd(sys.executable, dst)
-            subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden",
-                              "-Command", ps], creationflags=0x08000000, close_fds=True)
+            tmp = os.path.join(tempfile.gettempdir(),
+                               "hs300_update_%s_%d.exe" % (info["version"], os.getpid()))
+            download_release_asset(info, tmp)
+            # 装到旧 exe 旁边、用带版本号的新文件名：
+            # 绝不覆盖正在运行的自己（覆盖会让新进程读到半截文件，报 python313.dll 解压失败）
+            src_exe = os.path.abspath(sys.executable)
+            target_dir = os.path.dirname(src_exe)
+            new_exe = os.path.join(target_dir,
+                                   "eyupai-hs300-basis-v%s.exe" % info["version"])
+            if os.path.abspath(new_exe).lower() == src_exe.lower():
+                new_exe = os.path.join(target_dir,
+                                       "eyupai-hs300-basis-v%s-new.exe" % info["version"])
+            shutil.copyfile(tmp, new_exe)
+            if os.path.getsize(new_exe) != os.path.getsize(tmp):
+                raise RuntimeError("复制不完整")
+            subprocess.Popen([new_exe], cwd=target_dir, close_fds=True)
             self.q.put(("quit", None))
         except Exception as e:
             self.q.put(("upderr", "更新失败：%s" % e))
 
     def _on_upd_err(self, msg):
         self._upd_busy = False
+        self._updating = False      # 正在下载/安装更新
         if getattr(self, "_upd_cv", None) is not None:
             try:
                 self._upd_cv.itemconfigure(self._popup_msg, text=str(msg)[:34])
@@ -1293,15 +1299,22 @@ def fetch_releases(timeout=8):
     for it in data if isinstance(data, list) else []:
         if not isinstance(it, dict) or it.get("draft"):
             continue
-        exes = [a.get("browser_download_url") for a in (it.get("assets") or [])
-                if str(a.get("name", "")).lower().endswith(".exe")
-                and (a.get("size") or 0) > 3 * 1024 * 1024]
+        best = None
+        for a in (it.get("assets") or []):
+            if not str(a.get("name", "")).lower().endswith(".exe"):
+                continue
+            if (a.get("size") or 0) > 3 * 1024 * 1024:
+                best = a
+                break
         out.append({
             "version": str(it.get("tag_name", "")).strip().lstrip("vV"),
             "name": it.get("name") or "",
             "notes": _clean_notes(it.get("body") or ""),
             "url": it.get("html_url") or REPO_URL + "/releases",
-            "exe": exes[0] if exes else "",
+            "exe": (best or {}).get("browser_download_url") or "",
+            "api_exe": (best or {}).get("url") or "",
+            "size": (best or {}).get("size") or 0,
+            "digest": (best or {}).get("digest") or "",
             "date": str(it.get("published_at") or "")[:10],
         })
     if not out:
@@ -1322,18 +1335,55 @@ def fetch_latest_release(timeout=8):
     return rels[0] if rels else None
 
 
-def _self_update_cmd(dst_exe, new_exe):
-    """生成 PowerShell 脚本：等旧进程退出 -> 覆盖 -> 重启。含中文路径也安全。"""
-    q = lambda s: str(s).replace("'", "''")
-    return (
-        "$ErrorActionPreference='SilentlyContinue';"
-        "$dst='%s';$src='%s';"
-        "for($i=0;$i -lt 60;$i++){"
-        "  try{Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop;break}"
-        "  catch{Start-Sleep -Milliseconds 500}"
-        "};"
-        "if(Test-Path -LiteralPath $dst){Start-Process -FilePath $dst}"
-    ) % (q(dst_exe), q(new_exe))
+def _verify_download(path, info):
+    """核对下载结果：大小必须一致；Release 提供了 sha256 摘要就再比一次。"""
+    size = os.path.getsize(path)
+    want = int(info.get("size") or 0)
+    if want and size != want:
+        raise RuntimeError("文件大小不对（%d / %d 字节）" % (size, want))
+    with open(path, "rb") as f:
+        if f.read(2) != b"MZ":
+            raise RuntimeError("下载到的不是 exe")
+    digest = str(info.get("digest") or "")
+    if digest.startswith("sha256:"):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for blk in iter(lambda: f.read(1 << 20), b""):
+                h.update(blk)
+        if h.hexdigest().lower() != digest[7:].strip().lower():
+            raise RuntimeError("文件校验失败（sha256 对不上，可能下载被中断或被代理改过）")
+    return True
+
+
+def download_release_asset(info, dst, attempts=3):
+    """下载 Release 附件到 dst，带校验和重试。返回 True/抛异常。"""
+    urls = [u for u in (info.get("exe"), info.get("api_exe")) if u]
+    last = None
+    for url in urls:
+        api = "api.github.com" in url
+        for _ in range(attempts):
+            try:
+                headers = {"User-Agent": "hs300-basis-widget/%s" % APP_VERSION,
+                           "Accept-Encoding": "identity"}   # 别让代理压缩二进制
+                if api:
+                    headers["Accept"] = "application/octet-stream"
+                with requests.get(url, stream=True, timeout=180, headers=headers) as r:
+                    r.raise_for_status()
+                    with open(dst, "wb") as f:
+                        for chunk in r.iter_content(65536):
+                            if chunk:
+                                f.write(chunk)
+                _verify_download(dst, info)
+                return True
+            except Exception as e:
+                last = e
+                try:
+                    if os.path.exists(dst):
+                        os.remove(dst)
+                except OSError:
+                    pass
+                time.sleep(1.5)
+    raise RuntimeError(str(last) if last else "下载失败")
 
 
 # ==================================================================

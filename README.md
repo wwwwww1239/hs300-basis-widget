@@ -2,7 +2,7 @@
 
 <p align="center"><img src="docs/logo.png" width="112" alt="logo"></p>
 
-![Version](https://img.shields.io/badge/version-v1.2.0-orange)
+![Version](https://img.shields.io/badge/version-v1.2.1-orange)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![Platform](https://img.shields.io/badge/平台-Windows%2010%2F11-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -48,7 +48,7 @@
 
 ## 下载即用（推荐，不需要装 Python）
 
-到 [Releases](https://github.com/wwwwww1239/hs300-basis-widget/releases) 页面下载 **`eyupai-hs300-basis-v1.2.0.exe`**（约 14 MB，单文件），双击就能用，不用装 Python、不用 pip。
+到 [Releases](https://github.com/wwwwww1239/hs300-basis-widget/releases) 页面下载 **`eyupai-hs300-basis-v1.2.1.exe`**（约 14 MB，单文件），双击就能用，不用装 Python、不用 pip。
 
 > 第一次运行 Windows 可能弹「Windows 已保护你的电脑」→ 点「更多信息」→「仍要运行」。这是没买代码签名证书的正常提示。
 >
@@ -180,9 +180,17 @@ pip install pyinstaller
 pyinstaller -F -w -n eyupai-hs300-basis --icon 鳄鱼派.ico --add-data "鳄鱼派.ico;." 鳄鱼派_沪深300基差.py
 ```
 
-生成的 `dist\eyupai-hs300-basis.exe` 可以直接发给别人双击运行（图标就是仓库里的 `鳄鱼派.ico`，源图是那只鳄鱼摆件）。发布到 Releases 时把文件名带上版本号即可，例如 `eyupai-hs300-basis-v1.2.0.exe`。
+生成的 `dist\eyupai-hs300-basis.exe` 可以直接发给别人双击运行（图标就是仓库里的 `鳄鱼派.ico`，源图是那只鳄鱼摆件）。发布到 Releases 时把文件名带上版本号即可，例如 `eyupai-hs300-basis-v1.2.1.exe`。
 
 ## 更新日志
+
+### v1.2.1 (2026-11-04)
+
+- **修复自动更新把程序搞坏**：旧版本是「下载 → 覆盖正在运行的自己 → 重启」，覆盖时新进程可能读到写了一半的文件，报 Failed to extract python313.dll。
+  现在改成**旁路安装**：新版本装成 eyupai-hs300-basis-v新版本.exe（放在旧文件旁边），绝不覆盖正在运行的 exe，启动成功后旧文件仍然可用（确认没问题可以手动删）
+- **下载加校验**：按 Release 附件的大小和 sha256 摘要逐字节核对，对不上就重试（最多 3 次，并换用 API 直链），仍然失败会明确提示「手动到 Releases 下载」，不会再把坏文件当成功
+- **防重复点击**：连点「立即更新」不会再开两个线程写同一个临时文件（这也是文件被写坏的另一个原因）
+- 下载时带 Accept-Encoding: identity，避免代理压缩二进制导致内容错位
 
 ### v1.2.0 (2026-11-03)
 
